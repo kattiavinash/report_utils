@@ -85,7 +85,7 @@ class EmailEscalator:
                 f"{escalation['run_id']} ({escalation['tenant_name']}): "
                 f"{escalation['latest_status']} after attempt "
                 f"{escalation['latest_attempt_number']} "
-                f"[{escalation['retry_disposition']}]"
+                f"[{escalation['action']}] - {escalation['reason']}"
             )
 
         message = EmailMessage()

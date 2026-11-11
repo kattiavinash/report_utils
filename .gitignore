@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local retry and AI runtime data
+data/retry_logs.json
+data/root_cause_analysis.json

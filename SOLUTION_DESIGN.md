@@ -1,99 +1,79 @@
 # Report Delivery Reliability — Solution Design
 
-## Problem
+## Problem and assumptions
 
-Meridian Payments needs to identify scheduled report runs that have not
-successfully completed, distinguish successful runs from failed attempts, and
-surface safe retry opportunities before customers report a missing statement.
-The supplied log is attempt-level: several attempts can belong to one logical
-run, keyed by `run_id`. Treating each failed row as a failed report would
-misclassify runs that later completed.
+The input stores one row per attempt, and `run_id` identifies a logical report
+run. A run is successful if any attempt has status `completed`. The latest
+attempt controls the next action when there is no success:
 
-## Findings and assumptions
+- `failed` or `error` stops automated processing and requires manual review.
+- `timed_out` is retried while total attempt count is below the configured
+  maximum (3 by default, including the original attempt).
+- A timeout at the limit is escalated.
+- The retry implementation is a simulator: it randomly returns one of the
+  existing statuses (`completed`, `failed`, `error`, `timed_out`).
 
-The sample has 15 attempts, 12 logical runs, and four distinct statuses:
-`completed`, `failed`, `timed_out`, and `error`.
+The supplied records contain no historical log text and do not establish that
+real statement generation is idempotent. Simulated retry outcomes and their
+synthetic logs are explicitly marked; they must not be interpreted as real job
+history.
 
-- `completed` is the only success status. A run succeeds if any of its
-  attempts is completed.
-- `failed`, `error`, and `timed_out` are unsuccessful attempt statuses.
-- The latest attempt determines the current unresolved reason when the run has
-  no completed attempt. Unrecognized or missing statuses are marked unknown
-  and sent for manual review.
-- Only a latest `timed_out` attempt is a retry candidate. The limit is three
-  total attempts, including the original attempt. `failed` and `error` are
-  surfaced, not automatically retried, until their semantics and side effects
-  are understood.
-- Retry safety is not established by the sample. This policy must remain
-  disabled from real execution until report generation is confirmed
-  idempotent or protected with a deduplication key.
-- The prototype's retry plan is a simulation. It proposes a next attempt and
-  marks it `retry_planned`; it does not call a runner or claim a result.
-- Email is implemented as an SMTP notifier but disabled by default. Local
-  tests and standard runs use dry-run logging only.
+## Approach
 
-## Proposed approach
+`ReportJobAnalyzer` produces one concise row per `run_id`: latest job/status,
+attempt count, action, and reason. `DummyRetryProcessor.retry_job()` only
+chooses and returns a status. The Python script workflow handles the loop and
+persists each simulated attempt to the configured jobs JSON file; a separate
+JSON file stores its generated log. The loop stops at success, a non-timeout
+failure, or the attempt limit. Exhausted timeouts and `failed`/`error` cases
+are passed to the existing email escalation component, which is dry-run by
+default. Before calling the retry function, the analyzer selects only records
+whose action is `retry`; the retry function does not reload or reclassify the
+full dataset. After writing attempts, the full JSON file is reloaded for the
+final report. Settings live in `constants.py`; retries are disabled by default.
 
-`load_jobs_dataframe` parses and validates the JSON `jobs` array, then builds a
-pandas DataFrame. It rejects malformed payloads, duplicate `job_id` values,
-duplicate attempt numbers per run, and invalid IDs/attempt numbers. Statuses
-are normalized before classification so casing and surrounding whitespace do
-not produce false unknowns.
+Optional AI analysis is triggered through a localhost HTTP endpoint,
+`POST /api/root-cause`, rather than the reporting CLI. The API filters job
+attempts to those whose status is not `completed`, joins their log strings, and
+sends only sanitized log strings to the model in batches of at most 20. Job
+IDs, tenant data, statuses, duration/count metadata, and source files are not
+sent. Attempts with no log text are skipped; the supplied historical sample
+therefore produces no AI request. The client lives in
+`bin/ai_integration.py`. Calls require explicit opt-in and a GitHub token
+authorized for model inference; repository read access alone is insufficient.
+Model output is advisory.
 
-`ReportJobAnalyzer` creates four views:
+The CLI can write `run_summary.csv` and `escalations.csv` for inspection.
 
-1. An attempt audit retaining every source attempt.
-2. One run summary per `run_id`, with success determined across all attempts.
-3. A retry plan with the latest status, proposed next attempt (when eligible),
-   and a human-readable decision reason.
-4. An escalation list for exhausted retries, non-retryable failures, and
-   unknown statuses.
+## Trade-offs and limitations
 
-The CLI prints unresolved runs and retry decisions. An optional output
-directory receives CSV copies of the four views. `EmailEscalator` reports
-escalations in dry-run mode by default and can use Python's standard SMTP
-client when explicitly enabled and configured.
+- A small, direct classifier and loop are easier to inspect than a separate
+  multi-stage planning model. The simulator does not provide runner execution,
+  backoff, concurrency control, or exactly-once behavior.
+- JSON is convenient for this exercise and keeps attempt records inspectable.
+  Atomic replacement helps avoid partial writes but does not support concurrent
+  writers or database transactions.
+- The three-attempt default and timeout-only retry are conservative starting
+  points. A timeout does not prove a retry is safe: production integration
+  requires idempotency or a deduplication key.
+- Random outcomes make retry demonstrations simple, not predictive. A seeded
+  run helps reproduce a demo.
+- AI batching reduces request count, but remote inference still has privacy,
+  cost, and correctness trade-offs. Redaction is best-effort, not a guarantee.
+  Logs without usable text are excluded rather than analyzed from unrelated
+  job metadata.
+- The HTTP API binds to localhost by default. It should not be exposed to an
+  untrusted network without authentication and access controls.
+- Email is not delivered in tests or default runs; SMTP details remain
+  placeholders and dry-run mode is enabled.
 
-## Trade-offs
+## With more time, data, or budget
 
-- **Pandas and a full-file JSON read:** simple, transparent, and appropriate
-  for the supplied 15-row dataset and an initially bounded two-week report.
-  Memory and startup cost grow with the full history, so this is not an
-  unlimited-volume design.
-- **Timeout-only retry:** conservative about duplicate financial statement
-  generation. It may miss retryable transient failures, but avoids assuming
-  that every failure is safe to repeat.
-- **Three total attempts:** a clear initial cap with human escalation rather
-  than unbounded retry loops. It is configurable and should be tuned using
-  actual retry success rates, cost, and delivery objectives.
-- **CSV outputs and no database:** easy to inspect and reproduce without
-  introducing infrastructure. They do not provide durable coordination or
-  exactly-once behavior.
-- **SMTP dry-run default:** makes escalation logic testable without a server
-  or accidental customer-facing messages. Production delivery requires
-  secured credentials, provider configuration, retry/alerting for email
-  failures, and ownership of the escalation destination.
-
-## What to consider next
-
-With more time, data, and budget:
-
-- Confirm status meanings, job lifecycle guarantees, report idempotency, and
-  how a late completion interacts with retries.
-- Add error codes/messages, start/end timestamps, tenant delivery
-  acknowledgements, retry lineage, idempotency keys, and an explicit terminal
-  state to the event schema.
-- Measure timeout and retry success rates by report type and tenant; choose
-  capped exponential backoff with jitter and a retry budget based on those
-  observations.
-- Move attempt history to a durable database or event store with unique
-  constraints, transactional claims/leases, and audit records. Use a
-  scheduler/queue and idempotent runner adapter to perform retries safely.
-- For larger histories, ingest partitioned JSONL/Parquet or query the durable
-  store incrementally by scheduled-time window, aggregate in batches, and
-  avoid repeatedly loading the complete two-week dataset into memory.
-- Add metrics and alerting for unresolved runs, retry exhaustion, processing
-  lag, duplicate suppression, and notification failures, with dashboards and
-  an operator runbook.
-- Replace placeholder email settings with a managed notification provider,
-  secrets manager, delivery monitoring, and tested escalation ownership.
+Connect the workflow to the actual job runner and persist structured lifecycle
+events in a transactional store. Add an idempotency key, retry scheduling with
+bounded backoff, deduplication, and concurrency-safe claims. Collect real
+failure logs, resource metrics, and delivery confirmations; validate retry
+policy against historical outcomes. For AI, evaluate suggestions against
+labeled incidents, apply a data privacy review, monitor output quality, and
+retain model/prompt versions. Replace placeholder SMTP with a managed
+notification service and operational alerting.

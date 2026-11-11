@@ -1,48 +1,77 @@
+"""Summarize report runs and apply the configured retry rules."""
+
 import pandas as pd
 
-from bin.utils import Utils
-from constants import RETRY_EXHAUSTED, RETRY_MANUAL_REVIEW
-from model import ReportAnalysis, RetryPolicy
+import constants
+from model import ReportAnalysis
 
 
 class ReportJobAnalyzer:
-    """Analyze job history and derive run, retry, and escalation views."""
+    """Apply success, manual-review, retry, and exhaustion rules per run."""
 
-    def __init__(self, retry_policy: RetryPolicy | None = None) -> None:
-        """Create an analyzer with the supplied policy or conservative defaults."""
-        self.retry_policy = retry_policy or RetryPolicy()
+    def __init__(self, max_attempts: int = constants.MAX_TOTAL_ATTEMPTS) -> None:
+        """Set the maximum number of total attempts, including the original."""
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self.max_attempts = max_attempts
 
     def analyze(self, attempts: pd.DataFrame) -> ReportAnalysis:
-        """Build all analysis tables from validated attempt-level records."""
-        utils = Utils()
-        classified = utils.classify_attempts(attempts)
-        runs = utils._build_run_summary(classified)
-        retry_plan = utils._build_retry_plan(runs, self.retry_policy)
-        escalations = retry_plan[
-            retry_plan["retry_disposition"].isin({RETRY_EXHAUSTED, RETRY_MANUAL_REVIEW})
-        ].copy()
+        """Create one concise status/action row for each logical run."""
+        records = []
+        for run_id, group in attempts.groupby("run_id", sort=False, dropna=False):
+            ordered = group.sort_values("attempt_number", kind="stable")
+            latest = ordered.iloc[-1]
+            latest_status = str(latest["status"]).strip().lower()
+            attempt_count = len(ordered)
+            has_completed = (
+                ordered["status"].astype("string").str.strip().str.lower()
+                == constants.SUCCESS_STATUS
+            ).any()
 
-        audit = classified.merge(
-            retry_plan[
-                [
-                    "run_id",
-                    "latest_attempt_number",
-                    "retry_disposition",
-                    "proposed_attempt_number",
-                    "is_simulated",
-                ]
-            ],
-            on="run_id",
-            how="left",
-            validate="many_to_one",
-        )
-        audit["is_latest_attempt"] = audit["attempt_number"].eq(
-            audit["latest_attempt_number"]
-        )
+            if has_completed:
+                action = constants.ACTION_SUCCESS
+                reason = "A completed attempt exists."
+            elif latest_status in constants.MANUAL_REVIEW_STATUSES:
+                action = constants.ACTION_MANUAL_REVIEW
+                reason = "This failure status requires manual review."
+            elif latest_status == constants.RETRY_STATUS:
+                if attempt_count < self.max_attempts:
+                    action = constants.ACTION_RETRY
+                    reason = "Timed out below the maximum attempt count."
+                else:
+                    action = constants.ACTION_ESCALATE
+                    reason = "Maximum attempts exhausted."
+            else:
+                action = constants.ACTION_MANUAL_REVIEW
+                reason = f"Unrecognized status '{latest_status}' requires review."
 
-        return ReportAnalysis(
-            attempts=audit,
-            runs=runs,
-            retry_plan=retry_plan,
-            escalations=escalations,
-        )
+            first = ordered.iloc[0]
+            records.append(
+                {
+                    "run_id": run_id,
+                    "tenant_id": first["tenant_id"],
+                    "tenant_name": first["tenant_name"],
+                    "report_name": first["report_name"],
+                    "latest_job_id": latest["job_id"],
+                    "attempt_count": attempt_count,
+                    "latest_attempt_number": int(latest["attempt_number"]),
+                    "latest_status": latest_status,
+                    "action": action,
+                    "reason": reason,
+                }
+            )
+
+        columns = [
+            "run_id",
+            "tenant_id",
+            "tenant_name",
+            "report_name",
+            "latest_job_id",
+            "attempt_count",
+            "latest_attempt_number",
+            "latest_status",
+            "action",
+            "reason",
+        ]
+        runs = pd.DataFrame(records, columns=columns)
+        return ReportAnalysis(attempts=attempts.copy(), runs=runs)

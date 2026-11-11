@@ -1,108 +1,116 @@
 # Report Delivery Reliability Analyzer
 
-**Application version:** 1.0.0
-**Runtime used for this implementation:** Python 3.14.3, pandas 3.1.1
-**Supported runtime:** Python 3.10 or newer
+**Version:** 1.0.0
+**Runtime:** Python 3.10+ and pandas
 
-This prototype reads report-job attempt history from JSON, summarizes each
-logical report run, identifies runs that never completed, and proposes
-conservative retries. It does not connect to or execute jobs on an external
-job runner.
+This prototype reads attempt records from `data/report_jobs.json`, summarizes
+each logical report run, and can simulate retries. It does not execute or
+connect to a real job runner.
 
-## What the sample shows
+## Status and retry rules
 
-The supplied dataset has 15 attempts across 12 logical runs. `completed` means
-an attempt succeeded. A `run_id` is considered successful if any attempt
-completed, even if an earlier attempt failed. `failed`, `error`, and
-`timed_out` are non-success outcomes. Unknown statuses are surfaced for manual
-review.
+- `completed`: the logical run is successful.
+- `failed` or `error`: stop and require manual review.
+- `timed_out`: retry while the total attempt count is below the configured
+  maximum (default: 3, including the original).
+- `timed_out` at the maximum: stop and escalate.
 
-Only a latest `timed_out` status can be proposed for retry. The default limit is
-three total attempts, including the original attempt. A retry proposal is
-marked `retry_planned`; it is not an executed job attempt, and no result is
-invented. The sample's unsuccessful runs are surfaced for escalation, but it
-does not currently contain a latest timeout that is below the retry limit.
+The dummy retry method returns one random status from `completed`, `failed`,
+`error`, or `timed_out`. A retry that times out repeats while attempts remain;
+completion stops the loop, and `failed`/`error` stop for manual review.
 
-## Setup
-
-From the project directory, create and activate a virtual environment, then
-install dependencies:
+## Setup and run
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-```
-
-On Windows, activate the environment with `.venv\Scripts\activate`.
-
-## Run
-
-Analyze the bundled data:
-
-```bash
 python report_utils.py
 ```
 
-Use another JSON file and export CSV reports:
+The script uses the settings in `constants.py`. To run simulated retries and
+export CSV summaries, set the relevant values there before running:
 
-```bash
-python report_utils.py \
-  --data data/report_jobs.json \
-  --output-dir output \
-  --max-attempts 3
+```python
+RUN_RETRIES = True
+MAX_TOTAL_ATTEMPTS = 3
+OUTPUT_DIR = PROJECT_ROOT / "output"
+RETRY_SEED = 7
 ```
 
-The command prints runs that never completed, retry decisions, and the email
-notification mode. When `--output-dir` is supplied, it writes:
+Run the script again with `python report_utils.py`. The default is
+`RUN_RETRIES = False`, so the sample data is not modified unless retries are
+explicitly enabled in `constants.py`. Each generated attempt is marked
+`simulated: true`; its synthetic log is written separately. `RETRY_SEED` makes
+the random sequence reproducible. The retry-log file is ignored by git. If the
+retry limit is exhausted or a retry returns `failed`/`error`, the run is
+included in the escalation summary. Email stays in dry-run mode; no SMTP
+server is configured.
+Before retrying, the analyzer selects runs whose action is `retry` and passes
+only those run records to the retry loop. The loop does not reload or classify
+the entire jobs file to decide eligibility; after attempts are appended, the
+full file is reloaded to generate the final summary.
 
-- `attempts_audit.csv` — all source attempts plus classification and latest-run
-  decision fields.
-- `run_summary.csv` — one outcome row per logical `run_id`.
-- `retry_plan.csv` — the proposed retry disposition and, where eligible, the
-  next attempt number.
-- `escalations.csv` — unresolved runs that have exhausted retry policy or need
-  manual review.
+When `OUTPUT_DIR` is set, the output directory contains `run_summary.csv` and
+`escalations.csv`. The same workflow can be called from another Python module
+with parameters such as `main(run_retries=True, max_attempts=3)`.
 
-The input JSON must contain a top-level `jobs` array with the fields in the
-sample. The loader rejects malformed records, duplicate job IDs, duplicate
-attempt numbers within a run, and invalid attempt numbers.
+## Optional AI API
 
-## Email behavior and test safety
+All model client logic is in
+[`bin/ai_integration.py`](./bin/ai_integration.py). AI is triggered only through
+the local HTTP API, not through the report command-line options. The API reads
+the job and retry-log JSON files locally, selects logs belonging to attempts
+whose status is not `completed`, and sends only sanitized log strings to GitHub
+Models. It does not send job IDs, tenant information, statuses, durations, or
+the source files. Requests contain at most 20 logs each.
 
-No email is sent during testing or a default run. `constants.py` sets
-`EMAIL_ENABLED = False`; in this mode the notifier logs a dry-run message.
-SMTP host, sender, and recipient values in `constants.py` are placeholders,
-not working server credentials. There is no SMTP server configured here.
+The supplied historical sample has no log text for its non-completed attempts,
+so those records are skipped and no model request is made for them. AI
+suggestions from generated retry logs are advisory, not a confirmed diagnosis.
 
-For a real integration, confirm retry idempotency first, configure an
-authorized SMTP host, set `EMAIL_ENABLED = True`, and provide credentials via
-`REPORTS_SMTP_USERNAME` and `REPORTS_SMTP_PASSWORD`. The optional recipient
-override is `REPORTS_ESCALATION_RECIPIENT`. SMTP/configuration failures are
-surfaced to the caller.
+Start the local API:
+
+```bash
+export GITHUB_TOKEN="<token authorized for GitHub Models inference>"
+export GITHUB_MODELS_INFERENCE_ENABLED=true
+python api.py
+```
+
+Request analysis over HTTP:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/root-cause \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+The API binds to localhost by default. Set `REPORT_API_HOST` and
+`REPORT_API_PORT` to change the bind address/port. Do not expose it to an
+untrusted network without adding authentication and access controls.
+
+Do not commit a token into `constants.py`. A public-repository read-only token
+does not by itself authorize model inference; use the minimum inference
+permission approved for your environment. Review log data handling before
+sending operational evidence to an external model. If AI opt-in is absent, the
+API returns a disabled response and does not send a model request.
 
 ## Tests
-
-Run the standard-library unit tests:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The tests cover sample outcome aggregation, timeout retry decisions and limits,
-unknown/non-retryable statuses, empty input, malformed input, dry-run email,
-and report exports. They do not contact an SMTP server.
+Tests use temporary files and mock model/retry outcomes; they do not call a
+real runner, modify the sample dataset, or send email. The HTTP API test uses
+loopback only and mocks the model client.
 
-## Known limitations
+## Limitations
 
-- Retry safety is not proven by a timeout status. The report-generation side
-  effect must be idempotent or deduplicated before enabling a real retry
-  executor.
-- This is a local, in-memory pandas analysis and simulator. It has no durable
-  attempt ledger, scheduler, distributed locking, concurrency control, or
-  integration with a job runner.
-- The JSON file is loaded in full. This is appropriate for the supplied
-  exercise dataset, not an unlimited two-week production history. See
-  [SOLUTION_DESIGN.md](./SOLUTION_DESIGN.md) for a scale-up path.
-- The attempt schema does not include error details, report delivery
-  confirmation, or an explicit retryability/idempotency key.
+- Retries are randomized demonstrations, not real job executions.
+- JSON is a single-process demo store. Atomic file replacement does not provide
+  multi-writer transactions or production-grade durability.
+- Retry safety depends on idempotent report generation; confirm this before
+  connecting a real runner.
+- The sample lacks log messages for historical failures.
+- SMTP is deliberately dry-run. Configure a real email service separately.
